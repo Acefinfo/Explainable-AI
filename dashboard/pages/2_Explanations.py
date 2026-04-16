@@ -1,3 +1,4 @@
+import re
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -14,12 +15,12 @@ from utils.loader import (
     load_test_data, get_feature_names, MODEL_OPTIONS
 )
 
-st.set_page_config(page_title="Explanations",  layout="wide")
+st.set_page_config(page_title="Explanations", layout="wide")
 st.title("SHAP & LIME Explanations")
 st.caption("Explore how the models explain their predictions — globally and for individual students.")
 
 # --------------------------------------------------
-# Load resources(Data and models)
+# Load resources
 # --------------------------------------------------
 scaler           = load_scaler()
 X_train, y_train = load_train_data()
@@ -27,19 +28,16 @@ X_test,  y_test  = load_test_data()
 feature_names    = get_feature_names()
 
 # --------------------------------------------------
-# Sidebar — model selector
+# Sidebar
 # --------------------------------------------------
 st.sidebar.markdown("### Controls")
-
 selected_model_name = st.sidebar.selectbox(
-    "Select model",
-    list(MODEL_OPTIONS.keys()),
-    index=0
+    "Select model", list(MODEL_OPTIONS.keys()), index=0
 )
 model = load_model(MODEL_OPTIONS[selected_model_name])
 
 # --------------------------------------------------
-# Decide data source — session state or test set
+# Data source
 # --------------------------------------------------
 has_user_input = "input_df" in st.session_state
 
@@ -51,8 +49,7 @@ if has_user_input:
     use_user_input = st.radio(
         "Data to explain:",
         ["Student from Predict page", "Pick from test dataset"],
-        index=0,
-        horizontal=True
+        index=0, horizontal=True
     )
 else:
     st.warning(
@@ -62,11 +59,9 @@ else:
     )
     use_user_input = "Pick from test dataset"
 
-# Output for the explanation when the user had no input and is trying to explore the models understanding.
 if use_user_input == "Pick from test dataset" or not has_user_input:
-    sample_idx = st.sidebar.slider(
-        "Test sample to explain",
-        min_value=0, max_value=len(X_test) - 1, value=0
+    sample_idx   = st.sidebar.slider(
+        "Test sample to explain", 0, len(X_test) - 1, 0
     )
     input_df     = X_test.iloc[[sample_idx]]
     actual_label = "PASS" if int(y_test.iloc[sample_idx]) == 1 else "FAIL"
@@ -79,155 +74,238 @@ else:
 pred_raw   = model.predict(input_df)[0]
 pred_label = "PASS" if pred_raw == 1 else "FAIL"
 pred_proba = model.predict_proba(input_df)[0]
+pass_pct   = round(pred_proba[1] * 100, 1)
+fail_pct   = round(pred_proba[0] * 100, 1)
 
 st.sidebar.markdown("---")
 st.sidebar.markdown(f"**Source:** {source_label}")
 st.sidebar.markdown(f"**Actual outcome:** {actual_label}")
 st.sidebar.markdown(f"**Model predicted:** {pred_label}")
-st.sidebar.metric("Pass confidence", f"{round(pred_proba[1]*100, 1)}%")
+st.sidebar.metric("Pass confidence", f"{pass_pct}%")
 
 # --------------------------------------------------
-# Compute SHAP values — fixed array handling
+# SHAP computation
 # --------------------------------------------------
 def compute_shap(model, model_name, input_df, X_test, X_train, feature_names):
-    """
-    Compute SHAP values for both global (dataset-level) and local (single instance)
-    explanations, with support for multiple model types and SHAP output formats.
-
-    This function handles:
-    - Tree-based models using TreeExplainer (optimized and faster)
-    - Non-tree models using the general SHAP Explainer
-    - Different SHAP output formats across versions (list, 2D, 3D arrays)
-    - Binary classification by extracting SHAP values for the positive class (index 1)
-
-    Parameters:
-        model : object
-            Trained machine learning model used for prediction.
-
-        model_name : str
-            Name of the selected model. Used to determine whether to apply
-            TreeExplainer (for tree-based models) or the general Explainer.
-
-        input_df : pandas.DataFrame
-            Single input sample (1 row) for which local SHAP explanation is computed.
-
-        X_test : pandas.DataFrame
-            Test dataset used to compute global SHAP values.
-
-        X_train : pandas.DataFrame
-            Training dataset required for initializing the general SHAP Explainer
-            (used for non-tree models).
-
-        feature_names : list
-            List of feature names (not directly used in computation but kept for consistency).
-
-    Returns:
-        sv_single : numpy.ndarray or None
-            SHAP values for a single input sample (1D array of feature contributions).
-            Returns None if computation fails.
-
-        sv_all : numpy.ndarray or None
-            SHAP values for the entire test dataset (2D array: samples x features).
-            Returns None if computation fails.
-
-        base_val : float or None
-            Expected value (baseline prediction) from the SHAP explainer.
-            Represents the average model output before feature contributions.
-
-        status : bool or str
-            - True → SHAP computation successful
-            - str  → Error message if computation fails
-
-    Notes:
-        - For binary classification, SHAP values for class index 1 ("positive" class)
-          are used consistently.
-        - The function includes safeguards to handle differences in SHAP output
-          structure across library versions.
-        - Errors are caught and returned instead of raising exceptions to prevent
-          application crashes in interactive environments like Streamlit.
-    """
-    
     try:
-        # Tree Based models have a different SHAP explainer and output format.
         if model_name in ["Gradient Boosting (Best)", "Random Forest", "Decision Tree"]:
-            explainer = shap.TreeExplainer(model)
-
-            # Compute for all test data (global explanations)
-            raw_all = explainer.shap_values(X_test)
-            # Compute for single input (Local explanations)
+            explainer  = shap.TreeExplainer(model)
+            raw_all    = explainer.shap_values(X_test)
             raw_single = explainer.shap_values(input_df)
+            base_val   = explainer.expected_value
 
-            base_val = explainer.expected_value
-
-            # Handle different output shapes
             if isinstance(raw_all, list):
-                # Old SHAP — list of [class0, class1]
                 sv_all    = raw_all[1]
                 sv_single = raw_single[1][0]
                 base_val  = base_val[1] if hasattr(base_val, '__len__') else base_val
             elif np.array(raw_all).ndim == 3:
-                # New SHAP — shape (n_samples, n_features, n_classes)
                 sv_all    = np.array(raw_all)[:, :, 1]
                 sv_single = np.array(raw_single)[0, :, 1]
                 base_val  = base_val[1] if hasattr(base_val, '__len__') else base_val
             else:
                 sv_all    = raw_all
                 sv_single = raw_single[0]
-
-        # Non tree models use the general SHAP explainer with a single output format
-        else: 
-            explainer = shap.Explainer(model, X_train)
-            # Compute Shap values for all test data and single input
+        else:
+            explainer  = shap.Explainer(model, X_train)
             obj_all    = explainer(X_test)
             obj_single = explainer(input_df)
-            # Extracts SHAP values, handling both old and new SHAP output formats
-            sv_all    = obj_all.values[:, :, 1] if obj_all.values.ndim == 3 \
-                        else obj_all.values
-            sv_single = obj_single.values[0, :, 1] if obj_single.values.ndim == 3 \
-                        else obj_single.values[0]
-            
-            base_val  = explainer.expected_value
+            sv_all     = obj_all.values[:, :, 1] if obj_all.values.ndim == 3 \
+                         else obj_all.values
+            sv_single  = obj_single.values[0, :, 1] if obj_single.values.ndim == 3 \
+                         else obj_single.values[0]
+            base_val   = explainer.expected_value
 
         return sv_single, sv_all, base_val, True
-
     except Exception as e:
         return None, None, None, str(e)
 
 
-# --------------------------------------------------
-# Compute SHAP values for the selected model and input
-# --------------------------------------------------
-# The compute_shap() function returns:
-# - sv_single : SHAP values for a single input sample (local explanation)
-# - sv_all    : SHAP values for the entire test dataset (global explanation)
-# - base_val  : Expected value (baseline prediction of the model)
-# - shap_ok   : Status flag → True if successful, otherwise contains error message
 sv_single, sv_all, base_val, shap_ok = compute_shap(
     model, selected_model_name, input_df, X_test, X_train, feature_names
 )
-# Validate SHAP computation
 shap_computed = shap_ok is True
 
 # --------------------------------------------------
 # Dark chart helper
 # --------------------------------------------------
 def dark_fig(figsize=(6, 4)):
-    """
-    Create a dark-themed matplotlib figure for consistent UI styling.
-
-    Parameters:
-        figsize (tuple): Size of the figure (width, height)
-
-    Returns:
-        fig (Figure): Matplotlib figure object
-        ax (Axes): Matplotlib axes object for plotting
-    """
     fig, ax = plt.subplots(figsize=figsize)
     fig.patch.set_facecolor("#0e1117")
     ax.set_facecolor("#0e1117")
     ax.tick_params(colors="white", labelsize=8)
     ax.spines[:].set_color("#333")
     return fig, ax
+
+# --------------------------------------------------
+# Plain English helpers
+# --------------------------------------------------
+FEATURE_LABELS = {
+    "G1":             "first period grade (G1)",
+    "G2":             "second period grade (G2)",
+    "failures":       "number of past failures",
+    "absences":       "number of absences",
+    "studytime":      "weekly study time",
+    "goout":          "how often they go out",
+    "health":         "health status",
+    "age":            "age",
+    "Medu":           "mother's education level",
+    "Fedu":           "father's education level",
+    "famrel":         "family relationship quality",
+    "higher_yes":     "wanting higher education",
+    "internet_yes":   "having internet access",
+    "romantic_yes":   "being in a romantic relationship",
+    "schoolsup_yes":  "receiving extra school support",
+}
+
+def friendly(feature):
+    """Return a plain English label for a feature name."""
+    return FEATURE_LABELS.get(feature, feature.replace("_", " "))
+
+def interpret_global_shap(mean_abs_series):
+    """Generate plain English summary of global SHAP importance."""
+    top3 = mean_abs_series.sort_values(ascending=False).head(3)
+    names = [friendly(f) for f in top3.index]
+    return (
+        f"Across all students in the test set, the three features that "
+        f"influence the model's decisions the most are: "
+        f"**{names[0]}**, **{names[1]}**, and **{names[2]}**. "
+        f"This means these factors consistently matter most when predicting "
+        f"whether a student will pass or fail — regardless of the individual student."
+    )
+
+def interpret_local_shap(shap_df, pred_label, source_label):
+    """Generate plain English summary of local SHAP for one student."""
+    positive = shap_df[shap_df["SHAP"] > 0].sort_values("SHAP", ascending=False)
+    negative = shap_df[shap_df["SHAP"] < 0].sort_values("SHAP", ascending=True)
+
+    lines = [
+        f"For **{source_label}**, the model predicted **{pred_label}**. "
+        f"Here is why:"
+    ]
+
+    if not positive.empty:
+        top_pos = positive.iloc[0]
+        lines.append(
+            f"- The biggest reason pushing toward **PASS** is their "
+            f"**{friendly(top_pos['Feature'])}** "
+            f"(impact score: +{round(top_pos['SHAP'], 3)}). "
+            + (f"Their **{friendly(positive.iloc[1]['Feature'])}** also helped."
+               if len(positive) > 1 else "")
+        )
+
+    if not negative.empty:
+        top_neg = negative.iloc[0]
+        lines.append(
+            f"- The biggest factor working against them is their "
+            f"**{friendly(top_neg['Feature'])}** "
+            f"(impact score: {round(top_neg['SHAP'], 3)}). "
+            + (f"Their **{friendly(negative.iloc[1]['Feature'])}** also reduced the score."
+               if len(negative) > 1 else "")
+        )
+
+    if positive.empty:
+        lines.append("- No features are strongly pushing toward a PASS for this student.")
+    if negative.empty:
+        lines.append("- No features are working against this student.")
+
+    return "\n\n".join(lines)
+
+def interpret_lime(lime_df, pred_label, source_label):
+    """Generate plain English summary of LIME explanation."""
+    positive = lime_df[lime_df["Weight"] > 0].sort_values("Weight", ascending=False)
+    negative = lime_df[lime_df["Weight"] < 0].sort_values("Weight", ascending=True)
+
+    lines = [
+        f"LIME looked closely at **{source_label}** and found:"
+    ]
+
+    if not positive.empty:
+        cond = positive.iloc[0]["Feature condition"]
+        w    = round(positive.iloc[0]["Weight"], 3)
+        lines.append(
+            f"- The condition **\"{cond}\"** is the strongest reason "
+            f"pushing toward **PASS** (weight: +{w})."
+        )
+    if not negative.empty:
+        cond = negative.iloc[0]["Feature condition"]
+        w    = round(negative.iloc[0]["Weight"], 3)
+        lines.append(
+            f"- The condition **\"{cond}\"** is the strongest factor "
+            f"working against the student (weight: {w})."
+        )
+
+    lines.append(
+        f"Overall LIME agrees with the model's prediction of **{pred_label}**. "
+        f"Note that LIME explains one student at a time — it does not describe "
+        f"general model behaviour."
+    )
+    return "\n\n".join(lines)
+
+def interpret_comparison(corr, pval, shap_top, lime_top):
+    """Generate plain English interpretation of SHAP vs LIME agreement."""
+    shared = set(shap_top.index[:5]) & set(lime_top.index[:5])
+    level  = "strongly" if corr > 0.6 else "moderately" if corr > 0.3 else "weakly"
+
+    lines = [
+        f"**What does a Spearman correlation of {round(corr, 3)} mean?**",
+        f"A score of 1.0 means perfect agreement, 0 means random. "
+        f"Your score of **{round(corr, 3)}** means SHAP and LIME **{level} agree** "
+        f"on which features matter most for this student.",
+    ]
+
+    if shared:
+        shared_friendly = [friendly(f) for f in shared]
+        lines.append(
+            f"Both methods agree that the following features are important: "
+            f"**{', '.join(shared_friendly)}**."
+        )
+    else:
+        lines.append(
+            "The two methods do not share any features in their top 5 — "
+            "this suggests LIME's local approximation diverges significantly "
+            "from SHAP's calculation for this student."
+        )
+
+    if pval < 0.05:
+        lines.append(
+            f"The p-value of {round(pval, 4)} confirms this agreement is "
+            f"statistically significant — it is unlikely to be due to chance."
+        )
+    else:
+        lines.append(
+            "However, the p-value suggests this agreement may not be "
+            "statistically reliable for this particular student."
+        )
+
+    lines.append(
+        "**Key difference:** SHAP always gives the same answer for the same input. "
+        "LIME uses random sampling, so its answer can vary slightly each time — "
+        "this is why SHAP is considered more consistent for sensitive decisions."
+    )
+
+    return "\n\n".join(lines)
+
+def interpretation_box(text):
+    """Render a styled plain English interpretation box."""
+    def markdown_to_html_bold(value):
+        return re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", value)
+
+    safe_text = markdown_to_html_bold(text).replace(chr(10), "<br>")
+    st.markdown(
+        f"""<div style="background:#0f2027;border-left:3px solid #3b82f6;
+                        border-radius:0 8px 8px 0;padding:14px 16px;
+                        margin-top:10px;">
+                <div style="font-size:11px;font-weight:600;color:#93c5fd;
+                            margin-bottom:6px;text-transform:uppercase;
+                            letter-spacing:0.05em;">
+                    What does this mean?
+                </div>
+                <div style="font-size:13px;color:#cbd5e1;line-height:1.7;">
+                    {safe_text}
+                </div>
+            </div>""",
+        unsafe_allow_html=True
+    )
 
 
 # ==================== TABS ====================
@@ -237,6 +315,10 @@ tab1, tab2, tab3 = st.tabs(["SHAP", "LIME", "SHAP vs LIME"])
 # ── TAB 1: SHAP ──
 with tab1:
     st.subheader("SHAP Explanations")
+    st.caption(
+        "SHAP tells us how much each feature pushed the prediction toward "
+        "Pass (blue) or Fail (red), and by how much."
+    )
 
     if not shap_computed:
         st.error(f"Could not compute SHAP values: {shap_ok}")
@@ -244,10 +326,9 @@ with tab1:
         col_g, col_l = st.columns(2)
 
         with col_g:
-            st.markdown("**Global feature importance (test set)**")
+            st.markdown("**Global — which features matter most overall?**")
             mean_abs = pd.Series(
-                np.abs(sv_all).mean(axis=0),
-                index=feature_names
+                np.abs(sv_all).mean(axis=0), index=feature_names
             ).sort_values(ascending=True).tail(12)
 
             fig, ax = dark_fig()
@@ -258,17 +339,17 @@ with tab1:
             st.pyplot(fig)
             plt.close()
 
+            interpretation_box(interpret_global_shap(mean_abs))
+
         with col_l:
-            st.markdown(f"**Local explanation — {source_label}**")
+            st.markdown(f"**Local — why did the model decide this for {source_label}?**")
             shap_df = pd.DataFrame({
-                "Feature": feature_names,
-                "SHAP":    sv_single
+                "Feature": feature_names, "SHAP": sv_single
             }).reindex(
                 pd.Series(sv_single).abs().sort_values(ascending=False).index
             ).head(10).sort_values("SHAP")
 
             colors = ["#ef4444" if v < 0 else "#3b82f6" for v in shap_df["SHAP"]]
-
             fig, ax = dark_fig()
             ax.barh(shap_df["Feature"], shap_df["SHAP"], color=colors)
             ax.axvline(0, color="white", linewidth=0.8)
@@ -281,15 +362,20 @@ with tab1:
             st.pyplot(fig)
             plt.close()
 
+            interpretation_box(interpret_local_shap(shap_df, pred_label, source_label))
+
+        st.markdown("---")
         st.markdown("**Feature contributions table**")
-        top_feats = shap_df["Feature"].tolist()
-        raw_vals  = input_df.iloc[0]
+        top_feats  = shap_df["Feature"].tolist()
+        raw_vals   = input_df.iloc[0]
         display_df = pd.DataFrame({
-            "Feature":    top_feats,
-            "Value":      [round(float(raw_vals[f]), 3) for f in top_feats],
-            "SHAP value": [round(sv_single[feature_names.index(f)], 4) for f in top_feats],
-            "Direction":  ["→ Pass" if sv_single[feature_names.index(f)] > 0
-                           else "→ Fail" for f in top_feats]
+            "Feature":         top_feats,
+            "Scaled value":    [round(float(raw_vals[f]), 3) for f in top_feats],
+            "SHAP value":      [round(sv_single[feature_names.index(f)], 4)
+                                for f in top_feats],
+            "Direction":       ["→ Pass" if sv_single[feature_names.index(f)] > 0
+                                else "→ Fail" for f in top_feats],
+            "Plain English":   [friendly(f) for f in top_feats],
         })
         st.dataframe(display_df, use_container_width=True, hide_index=True)
 
@@ -297,7 +383,10 @@ with tab1:
 # ── TAB 2: LIME ──
 with tab2:
     st.subheader("LIME Explanations")
-    st.caption("LIME approximates the model locally around a single prediction.")
+    st.caption(
+        "LIME zooms in on one student at a time and asks: "
+        "which conditions most influenced this specific prediction?"
+    )
 
     num_features = st.slider("Number of features to show", 5, 15, 10)
 
@@ -324,7 +413,7 @@ with tab2:
         col_a, col_b = st.columns(2)
 
         with col_a:
-            st.markdown(f"**LIME local explanation — {source_label}**")
+            st.markdown(f"**LIME explanation — {source_label}**")
             colors = ["#ef4444" if v < 0 else "#3b82f6" for v in lime_df["Weight"]]
             fig, ax = dark_fig()
             ax.barh(lime_df["Feature condition"], lime_df["Weight"], color=colors)
@@ -338,8 +427,15 @@ with tab2:
             st.pyplot(fig)
             plt.close()
 
+            interpretation_box(interpret_lime(lime_df, pred_label, source_label))
+
         with col_b:
             st.markdown("**LIME weights table**")
+            st.caption(
+                "Each row is a condition about this student. "
+                "Positive weight → pushes toward Pass. "
+                "Negative weight → pushes toward Fail."
+            )
             st.dataframe(
                 lime_df.assign(Weight=lime_df["Weight"].round(4)),
                 use_container_width=True, hide_index=True
@@ -348,8 +444,7 @@ with tab2:
             st.markdown("**Prediction probabilities**")
             st.dataframe(pd.DataFrame({
                 "Outcome":     ["Fail", "Pass"],
-                "Probability": [f"{round(pred_proba[0]*100,1)}%",
-                                f"{round(pred_proba[1]*100,1)}%"]
+                "Probability": [f"{fail_pct}%", f"{pass_pct}%"]
             }), use_container_width=True, hide_index=True)
 
     except Exception as e:
@@ -359,7 +454,10 @@ with tab2:
 # ── TAB 3: SHAP vs LIME ──
 with tab3:
     st.subheader("SHAP vs LIME — Side-by-side Comparison")
-    st.caption("Both methods applied to the same student. Spearman correlation measures how much they agree on feature rankings.")
+    st.caption(
+        "Do both methods agree on what matters? "
+        "Spearman correlation measures how similar their feature rankings are."
+    )
 
     if not shap_computed:
         st.error("SHAP values could not be computed — comparison unavailable.")
@@ -417,27 +515,31 @@ with tab3:
                 st.pyplot(fig)
                 plt.close()
 
+            # Agreement metrics
             st.markdown("---")
             st.markdown("**Agreement between SHAP and LIME**")
             m1, m2, m3 = st.columns(3)
             m1.metric("Spearman correlation", f"{round(corr, 3)}")
             m2.metric("P-value", f"{round(pval, 4)}")
-            m3.metric("Agreement level",
-                      "Strong" if corr > 0.6 else
-                      "Moderate" if corr > 0.3 else "Weak")
+            m3.metric(
+                "Agreement level",
+                "Strong" if corr > 0.6 else "Moderate" if corr > 0.3 else "Weak"
+            )
 
-            if pval < 0.05:
-                st.success(
-                    f"Statistically significant agreement (p < 0.05). "
-                    f"Both methods {'strongly agree' if corr > 0.6 else 'moderately agree'} "
-                    f"on which features matter most."
-                )
-            else:
-                st.warning("Correlation is not statistically significant for this sample.")
-
-            st.markdown("**Feature rank comparison**")
+            # Plain English interpretation
             shap_top10 = shap_series.sort_values(ascending=False).head(10)
             lime_top10 = lime_series.sort_values(ascending=False).head(10)
+            interpretation_box(
+                interpret_comparison(corr, pval, shap_top10, lime_top10)
+            )
+
+            # Rank comparison table
+            st.markdown("---")
+            st.markdown("**Feature rank comparison table**")
+            st.caption(
+                "Rank 1 = most important. "
+                "Compare the SHAP and LIME columns to see where they agree and disagree."
+            )
             st.dataframe(pd.DataFrame({
                 "SHAP rank":     range(1, 11),
                 "SHAP feature":  shap_top10.index.tolist(),
