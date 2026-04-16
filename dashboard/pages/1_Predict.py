@@ -13,6 +13,9 @@ from utils.loader import (
     get_feature_names, MODEL_OPTIONS
 )
 
+if "prediction_history" not in st.session_state:
+    st.session_state["prediction_history"] = []
+
 st.set_page_config(page_title="Predict", page_icon="", layout="wide")
 st.title("Student Pass/Fail Prediction")
 
@@ -189,63 +192,117 @@ predict_btn = st.button("Run Prediction", type="primary", use_container_width=Tr
 if predict_btn:
     input_df   = build_input(feature_names)
 
-    st.session_state["input_df"]    = input_df
-    st.session_state["model_name"]  = selected_model_name
+    # Save to session state for Explanations + Model Comparison pages
+    st.session_state["input_df"]   = input_df
+    st.session_state["model_name"] = selected_model_name
 
     prediction = model.predict(input_df)[0]
     proba      = model.predict_proba(input_df)[0]
     pass_prob  = round(proba[1] * 100, 1)
     fail_prob  = round(proba[0] * 100, 1)
+    verdict    = "PASS" if prediction == 1 else "FAIL"
+
+    # --------------------------------------------------
+    # Save to prediction history
+    # --------------------------------------------------
+    st.session_state["prediction_history"].append({
+        "Model":            selected_model_name,
+        "G1":               G1,
+        "G2":               G2,
+        "Failures":         failures,
+        "Absences":         absences,
+        "Study time":       studytime,
+        "Prediction":       verdict,
+        "Pass probability": f"{pass_prob}%",
+        "Fail probability": f"{fail_prob}%",
+    })
 
     st.markdown("---")
     res_col, shap_col = st.columns([1, 2])
 
     with res_col:
+        st.subheader("Result")
+
+        # --- Verdict ---
         if prediction == 1:
-            st.success("### PASS")
-            st.metric("Pass probability", f"{pass_prob}%")
-            st.metric("Fail probability", f"{fail_prob}%")
+            st.success("## PASS")
         else:
-            st.error("### FAIL")
-            st.metric("Fail probability", f"{fail_prob}%")
-            st.metric("Pass probability", f"{pass_prob}%")
+            st.error("## FAIL")
 
-        st.caption(f"Model used: **{selected_model_name}**")
+        c1, c2 = st.columns(2)
+        c1.metric("Pass probability", f"{pass_prob}%")
+        c2.metric("Fail probability", f"{fail_prob}%")
+        st.caption(f"Model: **{selected_model_name}**")
 
-        if selected_model_name != best_model_name:
-            best_pred  = best_model.predict(input_df)[0]
-            best_proba = round(best_model.predict_proba(input_df)[0][1] * 100, 1)
-            st.info(
-                f"Best model (Gradient Boosting) predicts: "
-                f"**{'PASS' if best_pred == 1 else 'FAIL'}** "
-                f"({best_proba}% pass confidence)"
+        # --- Borderline warning ---
+        if 45 <= pass_prob <= 55:
+            st.warning(
+                "⚠️ **Borderline prediction** — the model is not confident "
+                f"(pass probability: {pass_prob}%). "
+                "A result this close to 50% should be treated with caution. "
+                "Consider reviewing the student's details or consulting "
+                "additional information before making a decision."
             )
 
+        # --- Input sanity warning ---
+        if G1 == 0 and G2 == 0:
+            st.warning(
+                "⚠️ **Unusual input** — both G1 and G2 are 0. "
+                "This is an extreme value that may produce unreliable predictions."
+            )
+        if absences > 50:
+            st.warning(
+                f"⚠️ **High absences** — {absences} absences is unusually high "
+                "and may strongly skew the prediction."
+            )
+
+        # --- Best model comparison if user switched ---
+        if selected_model_name != best_model_name:
+            st.markdown("---")
+            st.markdown("**Gradient Boosting (best model) says:**")
+            best_pred  = best_model.predict(input_df)[0]
+            best_proba = round(best_model.predict_proba(input_df)[0][1] * 100, 1)
+            if best_pred == 1:
+                st.success(f"PASS — {best_proba}% confidence")
+            else:
+                st.error(f"FAIL — {100 - best_proba}% confidence")
+
+        # --- Navigation hint ---
+        st.markdown("---")
+        st.info(
+            "Prediction saved! Go to **Explanations** to see why, "
+            "or **Model Comparison** to compare all 5 models on this student."
+        )
+
+    # --- SHAP chart ---
     with shap_col:
-        st.markdown("**Top features driving this prediction (SHAP)**")
+        st.subheader("Why this prediction? (SHAP)")
         try:
-            if selected_model_name in ["Gradient Boosting (Best)",
-                                        "Random Forest", "Decision Tree"]:
+            if selected_model_name in [
+                "Gradient Boosting (Best)", "Random Forest", "Decision Tree"
+            ]:
                 explainer = shap.TreeExplainer(model)
                 shap_vals = explainer.shap_values(input_df)
                 if isinstance(shap_vals, list):
                     sv = shap_vals[1][0]
-                elif shap_vals.ndim == 3:
-                    sv = shap_vals[0, :, 1]
+                elif np.array(shap_vals).ndim == 3:
+                    sv = np.array(shap_vals)[0, :, 1]
                 else:
                     sv = shap_vals[0]
             else:
                 explainer = shap.Explainer(model, X_train)
-                shap_vals = explainer(input_df)
-                sv = shap_vals.values[0]
+                sv_obj    = explainer(input_df)
+                sv        = sv_obj.values[0]
                 if sv.ndim == 2:
                     sv = sv[:, 1]
 
             shap_df = pd.DataFrame({
                 "Feature": feature_names,
                 "SHAP":    sv
-            }).reindex(pd.Series(sv).abs().sort_values(ascending=False).index)
-            shap_df = shap_df.head(10).sort_values("SHAP")
+            })
+            shap_df = shap_df.reindex(
+                shap_df["SHAP"].abs().sort_values(ascending=False).index
+            ).head(10).sort_values("SHAP")
 
             colors = ["#ef4444" if v < 0 else "#3b82f6" for v in shap_df["SHAP"]]
 
@@ -265,5 +322,57 @@ if predict_btn:
             st.pyplot(fig)
             plt.close()
 
+            # --- Plain English summary ---
+            top_pos = shap_df[shap_df["SHAP"] > 0].iloc[-1]
+            top_neg = shap_df[shap_df["SHAP"] < 0].iloc[0] \
+                      if len(shap_df[shap_df["SHAP"] < 0]) > 0 else None
+
+            summary = (
+                f"The strongest factor pushing toward **{verdict}** is "
+                f"**{top_pos['Feature']}** (SHAP: +{round(top_pos['SHAP'], 3)})"
+            )
+            if top_neg is not None:
+                summary += (
+                    f", while **{top_neg['Feature']}** works against it "
+                    f"(SHAP: {round(top_neg['SHAP'], 3)})."
+                )
+            else:
+                summary += "."
+
+            st.caption(summary)
+
         except Exception as e:
-            st.warning(f"SHAP explanation unavailable: {e}")
+            st.warning(f"SHAP explanation could not be generated: {e}")
+
+# --------------------------------------------------
+# Prediction history table
+# --------------------------------------------------
+if st.session_state["prediction_history"]:
+    st.markdown("---")
+    st.subheader("Prediction history — this session")
+    st.caption("All students predicted since you opened the app.")
+
+    history_df = pd.DataFrame(st.session_state["prediction_history"])
+
+    # Colour the Prediction column
+    def colour_verdict(val):
+        if val == "PASS":
+            return "background-color: #14532d; color: #86efac"
+        return "background-color: #7f1d1d; color: #fca5a5"
+
+    styled = history_df.style.applymap(colour_verdict, subset=["Prediction"])
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    # Download button
+    csv = history_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="Download history as CSV",
+        data=csv,
+        file_name="prediction_history.csv",
+        mime="text/csv"
+    )
+
+    # Clear history button
+    if st.button("Clear history"):
+        st.session_state["prediction_history"] = []
+        st.rerun()
